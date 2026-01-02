@@ -1,0 +1,16 @@
+# Node modules
+node_modules
+**/node_modules
+
+# Generated Prisma client (will be generated inside Docker)
+api/prisma/generated
+api/prisma/.prisma
+
+# Build outputs
+api/dist
+frontend/dist
+
+# Development files
+*.log
+.env.local
+.env.*.local

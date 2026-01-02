@@ -1,0 +1,524 @@
+# =============================================================================
+# SPA CI Pipeline with Validation Gates
+# =============================================================================
+# Implements the Evaluator-Fixer Loop pattern from AAAA-V1-VALIDATION-GATES.md
+#
+# Gates executed:
+#   1. install-gate    - Dependency installation
+#   2. typecheck-gate  - TypeScript compilation
+#   3. lint-gate       - ESLint checks
+#   4. build-gate      - Webpack/Module Federation build
+#   5. test-gate       - Unit and integration tests
+#   6. spa-compliance  - SPA V1-Spec compliance
+#
+# On failure: Errors are parsed and reported with actionable suggestions
+# =============================================================================
+
+name: CI Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '20'
+  PNPM_VERSION: '9.12.0'
+
+jobs:
+  # ===========================================================================
+  # GATE 1: Install Dependencies
+  # ===========================================================================
+  install:
+    name: Install Dependencies
+    runs-on: ubuntu-latest
+    outputs:
+      cache-key: ${{ steps.cache-key.outputs.key }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'pnpm'
+
+      - name: Generate cache key
+        id: cache-key
+        run: echo "key=${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}" >> $GITHUB_OUTPUT
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+        timeout-minutes: 5
+
+      - name: Cache node_modules
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            node_modules
+            frontend/node_modules
+            api/node_modules
+          key: ${{ steps.cache-key.outputs.key }}
+
+  # ===========================================================================
+  # GATE 2: TypeScript Type Check
+  # ===========================================================================
+  typecheck:
+    name: TypeScript Check
+    runs-on: ubuntu-latest
+    needs: install
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Restore cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            node_modules
+            frontend/node_modules
+            api/node_modules
+          key: ${{ needs.install.outputs.cache-key }}
+
+      - name: Generate Prisma Client (if exists)
+        run: |
+          if [ -f "api/prisma/schema.prisma" ]; then
+            cd api && pnpm prisma generate
+          fi
+
+      - name: Type check frontend
+        run: |
+          cd frontend && pnpm type-check 2>&1 | tee ../typecheck-frontend.log
+        continue-on-error: true
+        id: typecheck-frontend
+
+      - name: Type check API (if exists)
+        run: |
+          if [ -d "api" ]; then
+            cd api && pnpm type-check 2>&1 | tee ../typecheck-api.log
+          fi
+        continue-on-error: true
+        id: typecheck-api
+
+      - name: Parse TypeScript errors
+        if: steps.typecheck-frontend.outcome == 'failure' || steps.typecheck-api.outcome == 'failure'
+        run: |
+          echo "## TypeScript Errors" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ -f typecheck-frontend.log ]; then
+            echo "### Frontend" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            grep -E "^[^:]+\([0-9]+,[0-9]+\): error TS" typecheck-frontend.log | head -20 >> $GITHUB_STEP_SUMMARY || true
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ -f typecheck-api.log ]; then
+            echo "### API" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            grep -E "^[^:]+\([0-9]+,[0-9]+\): error TS" typecheck-api.log | head -20 >> $GITHUB_STEP_SUMMARY || true
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Fail if typecheck failed
+        if: steps.typecheck-frontend.outcome == 'failure' || steps.typecheck-api.outcome == 'failure'
+        run: exit 1
+
+  # ===========================================================================
+  # GATE 3: ESLint
+  # ===========================================================================
+  lint:
+    name: ESLint Check
+    runs-on: ubuntu-latest
+    needs: install
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Restore cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            node_modules
+            frontend/node_modules
+            api/node_modules
+          key: ${{ needs.install.outputs.cache-key }}
+
+      - name: Lint frontend
+        run: |
+          cd frontend && pnpm lint --format stylish 2>&1 | tee ../lint-frontend.log
+        continue-on-error: true
+        id: lint-frontend
+
+      - name: Lint API (if exists)
+        run: |
+          if [ -d "api" ]; then
+            cd api && pnpm lint --format stylish 2>&1 | tee ../lint-api.log
+          fi
+        continue-on-error: true
+        id: lint-api
+
+      - name: Parse lint errors
+        if: steps.lint-frontend.outcome == 'failure' || steps.lint-api.outcome == 'failure'
+        run: |
+          echo "## ESLint Errors" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ -f lint-frontend.log ]; then
+            echo "### Frontend" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            head -50 lint-frontend.log >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+      # Lint is non-blocking (warning only) per V1-VALIDATION-GATES spec
+      - name: Report lint status
+        run: |
+          if [ "${{ steps.lint-frontend.outcome }}" == "failure" ]; then
+            echo "::warning::Lint errors detected - review recommended"
+          fi
+
+  # ===========================================================================
+  # GATE 4: Build (Webpack + Module Federation)
+  # ===========================================================================
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: [install, typecheck]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Restore cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            node_modules
+            frontend/node_modules
+            api/node_modules
+          key: ${{ needs.install.outputs.cache-key }}
+
+      - name: Generate Prisma Client (if exists)
+        run: |
+          if [ -f "api/prisma/schema.prisma" ]; then
+            cd api && pnpm prisma generate
+          fi
+
+      - name: Build frontend
+        run: |
+          cd frontend && pnpm build 2>&1 | tee ../build-frontend.log
+        timeout-minutes: 5
+        id: build-frontend
+
+      - name: Build API (if exists)
+        run: |
+          if [ -d "api" ] && [ -f "api/package.json" ]; then
+            cd api && pnpm build 2>&1 | tee ../build-api.log || true
+          fi
+        id: build-api
+
+      - name: Verify Module Federation output
+        run: |
+          if [ ! -f "frontend/dist/remoteEntry.js" ]; then
+            echo "::error::remoteEntry.js not found - Module Federation build failed"
+            exit 1
+          fi
+          echo "✅ remoteEntry.js generated successfully"
+
+      - name: Parse build errors
+        if: failure()
+        run: |
+          echo "## Build Errors" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ -f build-frontend.log ]; then
+            echo "### Frontend Build" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            grep -E "ERROR|error|Error" build-frontend.log | head -30 >> $GITHUB_STEP_SUMMARY || true
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-build
+          path: frontend/dist
+          retention-days: 7
+
+  # ===========================================================================
+  # GATE 5: Tests (Vitest)
+  # ===========================================================================
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    needs: [install, typecheck]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: test_db
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Restore cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            node_modules
+            frontend/node_modules
+            api/node_modules
+          key: ${{ needs.install.outputs.cache-key }}
+
+      - name: Setup database (if exists)
+        if: hashFiles('api/prisma/schema.prisma') != ''
+        env:
+          DATABASE_URL: postgresql://test:test@localhost:5432/test_db
+        run: |
+          cd api
+          pnpm prisma generate
+          pnpm prisma migrate deploy
+
+      - name: Run frontend tests
+        run: |
+          cd frontend && pnpm test --run --reporter=verbose 2>&1 | tee ../test-frontend.log
+        continue-on-error: true
+        id: test-frontend
+
+      - name: Run API tests (if exists)
+        if: hashFiles('api/package.json') != ''
+        env:
+          DATABASE_URL: postgresql://test:test@localhost:5432/test_db
+          NODE_ENV: test
+        run: |
+          cd api && pnpm test --run --reporter=verbose 2>&1 | tee ../test-api.log
+        continue-on-error: true
+        id: test-api
+
+      - name: Parse test results
+        run: |
+          echo "## Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "| Component | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Frontend | ${{ steps.test-frontend.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| API | ${{ steps.test-api.outcome || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Fail if tests failed
+        if: steps.test-frontend.outcome == 'failure' || steps.test-api.outcome == 'failure'
+        run: exit 1
+
+  # ===========================================================================
+  # GATE 6: SPA V1-Spec Compliance
+  # ===========================================================================
+  spa-compliance:
+    name: SPA Compliance Check
+    runs-on: ubuntu-latest
+    needs: [install, build]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Restore cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            node_modules
+            frontend/node_modules
+            api/node_modules
+          key: ${{ needs.install.outputs.cache-key }}
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-build
+          path: frontend/dist
+
+      - name: Check webpack.config.js exists
+        run: |
+          if [ ! -f "frontend/webpack.config.js" ]; then
+            echo "::error file=frontend/webpack.config.js::webpack.config.js not found - SPA must use Webpack (not Vite)"
+            exit 1
+          fi
+          echo "✅ webpack.config.js found"
+
+      - name: Check Module Federation configuration
+        run: |
+          if ! grep -q "ModuleFederationPlugin" frontend/webpack.config.js; then
+            echo "::error file=frontend/webpack.config.js::ModuleFederationPlugin not configured"
+            exit 1
+          fi
+          echo "✅ ModuleFederationPlugin configured"
+
+      - name: Check dashboard entry points
+        run: |
+          DASHBOARDS_DIR="frontend/src/dashboards"
+          if [ ! -d "$DASHBOARDS_DIR" ]; then
+            echo "::error::src/dashboards/ directory not found"
+            exit 1
+          fi
+
+          for component in PublicHome MemberHome CommissionerHome; do
+            if [ ! -f "$DASHBOARDS_DIR/${component}.tsx" ]; then
+              echo "::error file=$DASHBOARDS_DIR/${component}.tsx::Dashboard component ${component}.tsx not found"
+              exit 1
+            fi
+          done
+          echo "✅ All dashboard entry points present"
+
+      - name: Check for shell imports (anti-pattern)
+        run: |
+          SHELL_IMPORTS=$(grep -rn "@shell/" frontend/src/ 2>/dev/null || true)
+          if [ -n "$SHELL_IMPORTS" ]; then
+            echo "::error::Shell imports detected - SPAs must not import from @shell/*"
+            echo "$SHELL_IMPORTS"
+            exit 1
+          fi
+          echo "✅ No shell imports detected"
+
+      - name: Check DashboardProps usage
+        run: |
+          for component in PublicHome MemberHome CommissionerHome; do
+            if ! grep -q "DashboardProps" "frontend/src/dashboards/${component}.tsx"; then
+              echo "::warning file=frontend/src/dashboards/${component}.tsx::DashboardProps not used in ${component}"
+            fi
+          done
+          echo "✅ Dashboard components checked"
+
+      - name: Check communityId API header
+        run: |
+          if [ -f "frontend/src/lib/api-client.ts" ]; then
+            if ! grep -q "X-Community-ID" frontend/src/lib/api-client.ts; then
+              echo "::warning file=frontend/src/lib/api-client.ts::X-Community-ID header not found in API client"
+            else
+              echo "✅ X-Community-ID header configured"
+            fi
+          fi
+
+      - name: Check remoteEntry.js exports
+        run: |
+          if [ ! -f "frontend/dist/remoteEntry.js" ]; then
+            echo "::error::remoteEntry.js not found in build output"
+            exit 1
+          fi
+          echo "✅ remoteEntry.js exists"
+
+      - name: Check shared dependencies versions
+        run: |
+          echo "## Shared Dependencies" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Package | Version | Required |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|---------|----------|" >> $GITHUB_STEP_SUMMARY
+
+          # Check critical shared deps
+          REACT_VER=$(node -p "require('./frontend/package.json').dependencies.react" 2>/dev/null || echo "not found")
+          ROUTER_VER=$(node -p "require('./frontend/package.json').dependencies['react-router-dom']" 2>/dev/null || echo "not found")
+          ZUSTAND_VER=$(node -p "require('./frontend/package.json').dependencies.zustand" 2>/dev/null || echo "not found")
+
+          echo "| react | $REACT_VER | 19.2.0 |" >> $GITHUB_STEP_SUMMARY
+          echo "| react-router-dom | $ROUTER_VER | 7.9.4 |" >> $GITHUB_STEP_SUMMARY
+          echo "| zustand | $ZUSTAND_VER | 5.0.2 |" >> $GITHUB_STEP_SUMMARY
+
+      - name: SPA Compliance Summary
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## SPA V1-Spec Compliance: ✅ PASSED" >> $GITHUB_STEP_SUMMARY
+
+  # ===========================================================================
+  # Final Summary
+  # ===========================================================================
+  summary:
+    name: CI Summary
+    runs-on: ubuntu-latest
+    needs: [install, typecheck, lint, build, test, spa-compliance]
+    if: always()
+    steps:
+      - name: Generate summary
+        run: |
+          echo "# CI Pipeline Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Gate | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Install | ${{ needs.install.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| TypeCheck | ${{ needs.typecheck.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Lint | ${{ needs.lint.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Test | ${{ needs.test.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| SPA Compliance | ${{ needs.spa-compliance.result }} |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Check for failures
+        if: contains(needs.*.result, 'failure')
+        run: |
+          echo "::error::One or more validation gates failed"
+          exit 1

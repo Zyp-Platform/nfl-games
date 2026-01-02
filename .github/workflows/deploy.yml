@@ -1,0 +1,289 @@
+# =============================================================================
+# SPA Deploy Pipeline
+# =============================================================================
+# Deploys SPA to production after all validation gates pass
+# Supports multiple deployment targets: Vercel, AWS, Docker
+# =============================================================================
+
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+          - preview
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: '20'
+  PNPM_VERSION: '9.12.0'
+
+jobs:
+  # ===========================================================================
+  # Pre-deploy Validation Gates
+  # ===========================================================================
+  validate:
+    name: Pre-deploy Validation
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma Client (if exists)
+        run: |
+          if [ -f "api/prisma/schema.prisma" ]; then
+            cd api && pnpm prisma generate
+          fi
+
+      - name: Type check
+        run: |
+          cd frontend && pnpm type-check
+          if [ -d "../api" ]; then
+            cd ../api && pnpm type-check
+          fi
+
+      - name: Lint
+        run: |
+          cd frontend && pnpm lint
+          if [ -d "../api" ]; then
+            cd ../api && pnpm lint
+          fi
+
+      - name: Build
+        run: cd frontend && pnpm build
+
+      - name: Verify Module Federation
+        run: |
+          if [ ! -f "frontend/dist/remoteEntry.js" ]; then
+            echo "::error::Module Federation build failed - remoteEntry.js not found"
+            exit 1
+          fi
+
+      - name: Get version
+        id: version
+        run: |
+          VERSION=$(node -p "require('./frontend/package.json').version")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+  # ===========================================================================
+  # Build Production Assets
+  # ===========================================================================
+  build:
+    name: Build Production
+    runs-on: ubuntu-latest
+    needs: validate
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend (production)
+        run: cd frontend && NODE_ENV=production pnpm build
+        env:
+          NODE_ENV: production
+
+      - name: Upload frontend artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+          retention-days: 30
+
+      - name: Build API (if exists)
+        run: |
+          if [ -d "api" ] && [ -f "api/package.json" ]; then
+            cd api && pnpm prisma generate && pnpm build || true
+          fi
+
+      - name: Upload API artifacts (if exists)
+        if: hashFiles('api/dist/**') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-dist
+          path: api/dist
+          retention-days: 30
+
+  # ===========================================================================
+  # Deploy to Vercel (Frontend)
+  # ===========================================================================
+  deploy-vercel:
+    name: Deploy to Vercel
+    runs-on: ubuntu-latest
+    needs: [validate, build]
+    if: vars.DEPLOY_TARGET == 'vercel' || vars.DEPLOY_TARGET == ''
+    environment:
+      name: ${{ github.event.inputs.environment || 'production' }}
+      url: ${{ steps.deploy.outputs.url }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download frontend artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install Vercel CLI
+        run: npm install -g vercel@latest
+
+      - name: Deploy to Vercel
+        id: deploy
+        run: |
+          cd frontend
+
+          if [ "${{ github.event.inputs.environment }}" == "production" ] || [ "${{ github.ref }}" == "refs/heads/main" ]; then
+            URL=$(vercel deploy --prod --token=${{ secrets.VERCEL_TOKEN }} --yes)
+          else
+            URL=$(vercel deploy --token=${{ secrets.VERCEL_TOKEN }} --yes)
+          fi
+
+          echo "url=$URL" >> $GITHUB_OUTPUT
+          echo "Deployed to: $URL"
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+
+      - name: Add deployment summary
+        run: |
+          echo "## Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| URL | ${{ steps.deploy.outputs.url }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Version | ${{ needs.validate.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | ${{ github.event.inputs.environment || 'production' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
+
+  # ===========================================================================
+  # Deploy to Docker (Full Stack)
+  # ===========================================================================
+  deploy-docker:
+    name: Build & Push Docker
+    runs-on: ubuntu-latest
+    needs: [validate, build]
+    if: vars.DEPLOY_TARGET == 'docker'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download frontend artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+
+      - name: Download API artifacts (if exists)
+        uses: actions/download-artifact@v4
+        with:
+          name: api-dist
+          path: api/dist
+        continue-on-error: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ vars.DOCKER_REGISTRY || 'ghcr.io' }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ vars.DOCKER_REGISTRY || 'ghcr.io' }}/${{ github.repository }}
+          tags: |
+            type=sha
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ===========================================================================
+  # Post-deploy Validation
+  # ===========================================================================
+  smoke-test:
+    name: Smoke Test
+    runs-on: ubuntu-latest
+    needs: [deploy-vercel]
+    if: needs.deploy-vercel.result == 'success'
+    steps:
+      - name: Wait for deployment
+        run: sleep 30
+
+      - name: Health check
+        run: |
+          DEPLOY_URL="${{ needs.deploy-vercel.outputs.url }}"
+          if [ -n "$DEPLOY_URL" ]; then
+            curl -sSf "${DEPLOY_URL}" > /dev/null || {
+              echo "::error::Health check failed for ${DEPLOY_URL}"
+              exit 1
+            }
+            echo "✅ Health check passed"
+          fi
+
+      - name: Check remoteEntry.js accessibility
+        run: |
+          DEPLOY_URL="${{ needs.deploy-vercel.outputs.url }}"
+          if [ -n "$DEPLOY_URL" ]; then
+            curl -sSf "${DEPLOY_URL}/remoteEntry.js" > /dev/null || {
+              echo "::warning::remoteEntry.js not accessible at ${DEPLOY_URL}/remoteEntry.js"
+            }
+          fi

@@ -1,0 +1,241 @@
+# =============================================================================
+# SPA Pull Request Pipeline
+# =============================================================================
+# Runs on every PR to validate changes before merge
+# Includes preview deployment for visual review
+# =============================================================================
+
+name: Pull Request
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '20'
+  PNPM_VERSION: '9.12.0'
+
+jobs:
+  # ===========================================================================
+  # Quick Validation (Blocking)
+  # ===========================================================================
+  validate:
+    name: Validate PR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma Client (if exists)
+        run: |
+          if [ -f "api/prisma/schema.prisma" ]; then
+            cd api && pnpm prisma generate
+          fi
+
+      - name: Type check
+        run: |
+          cd frontend && pnpm type-check
+          if [ -d "../api" ]; then
+            cd ../api && pnpm type-check
+          fi
+
+      - name: Lint
+        run: |
+          cd frontend && pnpm lint
+        continue-on-error: true
+
+      - name: Build
+        run: cd frontend && pnpm build
+
+      - name: Verify Module Federation
+        run: |
+          if [ ! -f "frontend/dist/remoteEntry.js" ]; then
+            echo "::error::remoteEntry.js not found"
+            exit 1
+          fi
+
+  # ===========================================================================
+  # Test Suite
+  # ===========================================================================
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: test_db
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Setup database (if exists)
+        if: hashFiles('api/prisma/schema.prisma') != ''
+        env:
+          DATABASE_URL: postgresql://test:test@localhost:5432/test_db
+        run: |
+          cd api
+          pnpm prisma generate
+          pnpm prisma migrate deploy
+
+      - name: Run tests
+        run: |
+          cd frontend && pnpm test --run
+          if [ -d "../api" ]; then
+            cd ../api && DATABASE_URL=postgresql://test:test@localhost:5432/test_db pnpm test --run
+          fi
+
+  # ===========================================================================
+  # SPA Compliance Check
+  # ===========================================================================
+  spa-compliance:
+    name: SPA Compliance
+    runs-on: ubuntu-latest
+    needs: validate
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check webpack.config.js
+        run: |
+          if [ ! -f "frontend/webpack.config.js" ]; then
+            echo "::error::webpack.config.js not found - must use Webpack"
+            exit 1
+          fi
+
+      - name: Check Module Federation
+        run: |
+          if ! grep -q "ModuleFederationPlugin" frontend/webpack.config.js; then
+            echo "::error::ModuleFederationPlugin not configured"
+            exit 1
+          fi
+
+      - name: Check dashboard components
+        run: |
+          for comp in PublicHome MemberHome CommissionerHome; do
+            if [ ! -f "frontend/src/dashboards/${comp}.tsx" ]; then
+              echo "::error::Dashboard ${comp}.tsx not found"
+              exit 1
+            fi
+          done
+
+      - name: Check shell imports
+        run: |
+          if grep -rq "@shell/" frontend/src/; then
+            echo "::error::Shell imports detected"
+            exit 1
+          fi
+
+  # ===========================================================================
+  # Preview Deployment
+  # ===========================================================================
+  preview:
+    name: Preview Deploy
+    runs-on: ubuntu-latest
+    needs: [validate, test]
+    if: vars.ENABLE_PR_PREVIEWS == 'true'
+    environment:
+      name: preview
+      url: ${{ steps.deploy.outputs.url }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: cd frontend && pnpm build
+
+      - name: Deploy preview
+        id: deploy
+        run: |
+          npm install -g vercel@latest
+          cd frontend
+          URL=$(vercel deploy --token=${{ secrets.VERCEL_TOKEN }} --yes)
+          echo "url=$URL" >> $GITHUB_OUTPUT
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+
+      - name: Comment preview URL
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## 🚀 Preview Deployment\n\n**URL:** ${{ steps.deploy.outputs.url }}\n\n**remoteEntry.js:** ${{ steps.deploy.outputs.url }}/remoteEntry.js`
+            })
+
+  # ===========================================================================
+  # PR Summary
+  # ===========================================================================
+  summary:
+    name: PR Summary
+    runs-on: ubuntu-latest
+    needs: [validate, test, spa-compliance]
+    if: always()
+    steps:
+      - name: Generate summary
+        run: |
+          echo "# Pull Request Validation" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Validate | ${{ needs.validate.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Test | ${{ needs.test.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| SPA Compliance | ${{ needs.spa-compliance.result }} |" >> $GITHUB_STEP_SUMMARY

@@ -1,0 +1,49 @@
+{
+  "name": "@zyp/nfl-games",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "NFL Games - Game data and schedules",
+  "packageManager": "pnpm@9.12.0",
+  "engines": {
+    "node": ">=20.0.0",
+    "pnpm": "9.12.0"
+  },
+  "scripts": {
+    "dev": "concurrently \"pnpm:dev:frontend\" \"pnpm:dev:api\"",
+    "dev:frontend": "cd frontend && pnpm dev",
+    "dev:api": "cd api && pnpm dev",
+    "build": "pnpm build:frontend && pnpm build:api",
+    "build:frontend": "cd frontend && pnpm build",
+    "build:api": "cd api && pnpm build",
+    "test": "pnpm test:frontend && pnpm test:api",
+    "test:frontend": "cd frontend && pnpm test",
+    "test:api": "cd api && pnpm test",
+    "test:coverage": "pnpm test:frontend --coverage && pnpm test:api --coverage",
+    "lint": "pnpm lint:frontend && pnpm lint:api",
+    "lint:frontend": "cd frontend && pnpm lint",
+    "lint:api": "cd api && pnpm lint",
+    "type-check": "pnpm type-check:frontend && pnpm type-check:api",
+    "type-check:frontend": "cd frontend && tsc --noEmit",
+    "type-check:api": "cd api && tsc --noEmit",
+    "db:setup": "cd api && pnpm prisma:generate && pnpm prisma:migrate:deploy",
+    "db:reset": "cd api && pnpm prisma migrate reset --force",
+    "db:seed": "cd api && pnpm prisma db seed"
+  },
+  "dependencies": {
+    "react": "19.2.0",
+    "react-dom": "19.2.0"
+  },
+  "devDependencies": {
+    "concurrently": "8.2.0",
+    "vite": "7.1.10",
+    "@vitejs/plugin-react": "4.3.1",
+    "terser": "5.31.0",
+    "typescript": "5.4.5",
+    "eslint": "9.36.0",
+    "@typescript-eslint/eslint-plugin": "8.45.0",
+    "@typescript-eslint/parser": "8.45.0",
+    "typescript-eslint": "8.45.0",
+    "vitest": "3.2.4",
+    "zod": "3.23.0"
+  }
+}
